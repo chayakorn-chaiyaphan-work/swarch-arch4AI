@@ -1,14 +1,14 @@
 # Task 4: Deployment topologies and trade-offs
 
-**Name / ชื่อ:**
+**Name / ชื่อ:** Chayakorn Chaiyaphan
 
-**Student ID / รหัสนิสิต:**
+**Student ID / รหัสนิสิต:** 6632038021
 
 This is **individual work**: each student completes and submits their own copy, in their own fork.
 
 *งานนี้เป็น**งานเดี่ยว** นิสิตแต่ละคนทำและส่งงานของตัวเอง ใน fork ของตัวเอง*
 
-**Scenario (A, B or C) / Scenario ที่เลือก:**
+**Scenario (A, B or C) / Scenario ที่เลือก:** A — Owner alerts
 
 Choose **one** scenario below. If the last digit of your student ID is odd, take A or B; if it is even, take B or C. Use your measurements from Tutorial 6 as evidence: cite run names from `results/runs.csv`. Answer in Thai or English.
 
@@ -58,9 +58,9 @@ The three most important quality requirements for your scenario, each with a num
 
 | # | Quality | Requirement |
 |---|---|---|
-| 1 | | |
-| 2 | | |
-| 3 | | |
+| 1 | Performance | At the 40-reviews/second peak, at least 95% of high-confidence negative alerts we send should reach the owner within 2 seconds. |
+| 2 | Accuracy and trust | Keep accuracy at 90% or higher for scored reviews. Aim for at least 95% precision on push alerts; do not send alerts for pending or uncertain predictions. |
+| 3 | Capacity and cost | Keep large-model traffic at or below 20 calls/second. If capacity is full, save the review as pending and process it off-peak. |
 
 ## 2. Design / การออกแบบ
 
@@ -68,16 +68,38 @@ Your topology, the patterns you add, and a container-level diagram (C4 level 2).
 
 *topology ที่เลือก pattern ที่เพิ่ม และ diagram ระดับ container (C4 level 2) เขียนด้วย Mermaid*
 
+**Topology:** T3 Hybrid. Run the small model inside the Review service and call the remote large model only when small-model confidence is below 0.6. Save each review first. If a call times out, errors, or hits the quota, keep the review as pending and do not send a push. Cap large-model traffic at 20 calls/second. Send pushes only for scored negative predictions with confidence of at least 0.9; a batch worker can re-score pending reviews off-peak.
+
+I also checked the rules on the 500 reviews in `data/test.csv`. The 0.6 cascade reached 90.6% accuracy and sent 49.6% of reviews to the large model, or about 19.8 calls/second at peak—almost the full quota. The 0.9 alert gate produced 169 negative alerts with 95.3% precision and 60.3% recall. This was a separate held-out check, not a load test, so it should be checked again with production-like traffic.
+
+The diagram shows the prediction path, pending-review storage, and push-notification flow.
+
 ```mermaid
 C4Container
-    title Your design: container diagram
-    %% Replace the example below with your own people, containers and relationships.
-    %% See the CampusEats C4 diagram in README.md for the full syntax.
-    Person(customer, "Customer", "Writes restaurant reviews")
+    title Scenario A: time-bounded owner alerts
+    Person(customer, "Customer", "Posts restaurant reviews")
+    Person(owner, "Restaurant owner", "Receives negative-review push alerts")
     System_Boundary(campuseats, "CampusEats") {
-        Container(review, "Review service", "Python, FastAPI", "What it does")
+        Container(gateway, "API gateway", "Python, FastAPI", "Routes review requests")
+        Container(review, "Review service", "Python, FastAPI + local small model", "Stores each review; cascade threshold 0.6; 1-second fallback; emits only high-confidence negative alerts")
+        ContainerDb(reviewdb, "Review database", "SQL", "Durable reviews, labels, and pending status")
+        Container(inference, "Inference service", "Python, FastAPI + large model", "Remote model; hard cap of 20 calls per second")
+        Container(batch, "Pending-review worker", "Scheduled worker", "Re-scores pending reviews off-peak with a rate limit")
+        Container(alertq, "Alert queue", "Message broker", "Buffers scored negative alert events")
+        Container(alertworker, "Push worker", "Python worker", "Delivers owner push notifications")
     }
-    Rel(customer, review, "Posts reviews", "HTTP/JSON")
+    System_Ext(push, "Push provider", "Delivers notifications to owner devices")
+    Rel(customer, gateway, "Posts review", "HTTP/JSON")
+    Rel(gateway, review, "Forwards review", "HTTP/JSON")
+    Rel(review, reviewdb, "Persists review and prediction status", "SQL")
+    Rel(review, inference, "Calls only when small confidence is below 0.6; hard cap 20/s; waits at most 1 s", "HTTP/JSON")
+    Rel(batch, reviewdb, "Reads pending reviews")
+    Rel(batch, reviewdb, "Stores completed labels")
+    Rel(batch, inference, "Re-scores off-peak; throttled below live quota")
+    Rel(review, alertq, "Enqueues scored negative with confidence at least 0.9")
+    Rel(alertq, alertworker, "Delivers alert event")
+    Rel(alertworker, push, "Sends push")
+    Rel(push, owner, "Negative-review alert", "Push")
 ```
 
 ## 3. Evidence / หลักฐาน
@@ -88,8 +110,13 @@ Which runs support your choice? Show the numbers and, for scenario A, the capaci
 
 | Run | What it shows / แสดงอะไร |
 |---|---|
-| | |
-| | |
+| t0-large | 93.5% accuracy, 603 ms p95, and 100% large calls. At 40 reviews/s that would mean 40 large calls/s, twice the limit. |
+| t0-small | 72.5% accuracy and no large calls; fast and cheap, but below the 90% target. |
+| t2-0.6 | 91.5% accuracy, 623 ms p95, and 38% large calls. At peak: 40 × 0.38 = 15.2 large calls/s. |
+| t2-0.7 | 53% large calls, or 21.2 calls/s at peak; over the limit. |
+| t2-0.8 | 64% large calls, or 25.6 calls/s at peak; over the limit. |
+| t2-0.9 | 77% large calls, or 30.8 calls/s at peak; over the limit. |
+| t1-after | With the 10% hang test, there were 0 errors and 25 pending reviews. Fallback kept review posts from failing. |
 
 ## 4. ADR
 
@@ -97,20 +124,22 @@ Use the ADR format from W5.
 
 *ใช้รูปแบบ ADR จาก W5*
 
-**Title:**
+**Title:** Hybrid cascade for owner alerts
 
 **Status:** Proposed
 
-**Context:**
+**Context:** CampusEats gets 40 reviews per second at lunch, and owners need negative-review alerts within 2 seconds. The large model can handle only 20 calls per second. A wrong alert harms trust, while a missed alert is acceptable. `t0-large` sends every review to the large model; `t0-small` is only 72.5% accurate. Of the tested cascade thresholds, 0.6 is the only one that stays within the large-model limit for the measured load-test mix.
 
-**Decision:**
+**Decision:** Use T3 Hybrid. Run the small model in the Review service and call the remote large model when confidence is below 0.6. Save reviews before scoring; on timeout, error, or a full quota, mark the review pending and do not push an alert. Send a push only for a scored negative result with confidence of at least 0.9. Re-score pending reviews off-peak, with a limit on batch calls.
 
 **Consequences:**
-- Positive:
-- Negative:
+- Positive: At the `t2-0.6` mix, peak demand is about 15.2 large calls/s, and measured accuracy was 91.5%. The separate alert-gate check had 95.3% precision; skipping uncertain alerts helps avoid false alarms.
+- Negative: If many reviews are difficult, demand can hit the cap and some reviews will stay pending, which means missing those real-time alerts. The load test used concurrency 10 and did not include push delivery. The gate also missed 39.7% of actual negative reviews in the held-out check, so the full flow needs testing at production-like load.
 
 **Alternatives considered:** at least one topology you rejected, and why.
 
 *อย่างน้อยหนึ่ง topology ที่ไม่เลือก และเหตุผล*
 
->
+- **T1, synchronous large model for every review:** This would need 40 calls/s at peak, above the 20-call limit; `t0-large` sent every review to the large model.
+- **T2, small model only:** `t0-small` reached only 72.5% accuracy, below the 90% target, so it could produce too many wrong alerts.
+- **T4, batch-only scoring:** Scoring later cannot meet the 2-second alert deadline. Batch is used only to recover pending reviews off-peak.
